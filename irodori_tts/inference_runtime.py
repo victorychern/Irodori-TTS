@@ -644,11 +644,15 @@ class InferenceRuntime:
             section="checkpoint model_config",
         )
 
-        model = TextToLatentRFDiT(
-            model_cfg,
-            pretrained_backbone_config=text_encoder_config,
-            load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
-        )
+        construct_on_meta = not model_cfg.use_pretrained_text_encoder
+        with torch.device("meta") if construct_on_meta else nullcontext():
+            model = TextToLatentRFDiT(
+                model_cfg,
+                pretrained_backbone_config=text_encoder_config,
+                load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
+            )
+        if construct_on_meta:
+            model = model.to_empty(device="cpu")
         quantized_model = is_torchao_quantized_state_dict(model_state)
         model.load_state_dict(
             model_state,
