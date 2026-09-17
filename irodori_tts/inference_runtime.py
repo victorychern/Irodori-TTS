@@ -647,20 +647,21 @@ class InferenceRuntime:
         # Building on the meta device skips randomly initializing every
         # parameter (CPU RNG over the full checkpoint, ~10s for this model)
         # only to overwrite it a moment later via load_state_dict below.
-        # to_empty then allocates real (uninitialized) CPU storage for
-        # load_state_dict to fill in, same as a normal construction would end
-        # up with. Safe even when a pretrained HF backbone is in play:
         # PretrainedTextBackbone.__init__ forces real CPU construction for
-        # itself, since its RoPE buffers are computed with real arithmetic
-        # and registered non-persistent - meta would leave them as garbage
-        # that load_state_dict never restores.
+        # itself regardless of this ambient meta context, since its RoPE
+        # buffers are computed with real arithmetic and registered
+        # non-persistent - load_state_dict never restores them.
         with torch.device("meta"):
             model = TextToLatentRFDiT(
                 model_cfg,
                 pretrained_backbone_config=text_encoder_config,
                 load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
             )
-        model = model.to_empty(device="cpu")
+        # Plain `model.to_empty(...)` would materialize *every* parameter and
+        # buffer, real ones included - wiping out the backbone's correctly
+        # computed non-persistent RoPE buffers right back to garbage. Only
+        # replace what's actually still on meta.
+        model._apply(lambda t: torch.empty_like(t, device="cpu") if t.is_meta else t)
         quantized_model = is_torchao_quantized_state_dict(model_state)
         model.load_state_dict(
             model_state,
