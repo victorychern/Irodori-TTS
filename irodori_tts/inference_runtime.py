@@ -700,12 +700,29 @@ class InferenceRuntime:
                 checkpoint_path,
                 model_cfg.caption_tokenizer_repo_resolved,
             )
-            caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
-                repo_id=caption_tokenizer_source,
-                add_bos=model_cfg.caption_add_bos_resolved,
-                local_files_only=caption_tokenizer_is_local,
-                revision=(None if caption_tokenizer_is_local else model_cfg.text_encoder_revision),
-            )
+            if caption_tokenizer_source == text_tokenizer_source:
+                # Same file(s) the text tokenizer above already parsed -
+                # _resolve_tokenizer_source finds the same bundled directory
+                # for both when the checkpoint uses one shared tokenizer, and
+                # re-running AutoTokenizer.from_pretrained on it a second time
+                # cost ~0.7s of wall time on RunPod (confirmed per-call via
+                # tts_common/engine.py's tokenizer_load_calls instrumentation
+                # - both calls hit the identical repo_id). Reuse the parsed HF
+                # tokenizer instead of reloading it. Safe to share: __init__
+                # only sets padding_side/pad_token, both idempotent regardless
+                # of which wrapper does it, and add_bos is wrapper-level state
+                # that is never written back onto the shared tokenizer object.
+                caption_tokenizer = PretrainedTextTokenizer(
+                    tokenizer=tokenizer.tokenizer,
+                    add_bos=bool(model_cfg.caption_add_bos_resolved),
+                )
+            else:
+                caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
+                    repo_id=caption_tokenizer_source,
+                    add_bos=model_cfg.caption_add_bos_resolved,
+                    local_files_only=caption_tokenizer_is_local,
+                    revision=(None if caption_tokenizer_is_local else model_cfg.text_encoder_revision),
+                )
             if (
                 not model_cfg.use_pretrained_text_encoder
                 and caption_tokenizer.vocab_size != model_cfg.caption_vocab_size_resolved
