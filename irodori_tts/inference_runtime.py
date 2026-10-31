@@ -732,11 +732,24 @@ class InferenceRuntime:
             section="checkpoint model_config",
         )
 
-        model = TextToLatentRFDiT(
-            model_cfg,
-            pretrained_backbone_config=text_encoder_config,
-            load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
-        )
+        # Building on the meta device skips randomly initializing every
+        # parameter (CPU RNG over the full checkpoint, ~10s for this model)
+        # only to overwrite it a moment later via load_state_dict below.
+        # PretrainedTextBackbone.__init__ forces real CPU construction for
+        # itself regardless of this ambient meta context, since its RoPE
+        # buffers are computed with real arithmetic and registered
+        # non-persistent - load_state_dict never restores them.
+        with torch.device("meta"):
+            model = TextToLatentRFDiT(
+                model_cfg,
+                pretrained_backbone_config=text_encoder_config,
+                load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
+            )
+        # Plain `model.to_empty(...)` would materialize *every* parameter and
+        # buffer, real ones included - wiping out the backbone's correctly
+        # computed non-persistent RoPE buffers right back to garbage. Only
+        # replace what's actually still on meta.
+        model._apply(lambda t: torch.empty_like(t, device="cpu") if t.is_meta else t)
         quantized_model = is_torchao_quantized_state_dict(model_state)
         model.load_state_dict(
             model_state,
@@ -778,12 +791,29 @@ class InferenceRuntime:
                 checkpoint_path,
                 model_cfg.caption_tokenizer_repo_resolved,
             )
-            caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
-                repo_id=caption_tokenizer_source,
-                add_bos=model_cfg.caption_add_bos_resolved,
-                local_files_only=caption_tokenizer_is_local,
-                revision=(None if caption_tokenizer_is_local else model_cfg.text_encoder_revision),
-            )
+            if caption_tokenizer_source == text_tokenizer_source:
+                # Same file(s) the text tokenizer above already parsed -
+                # _resolve_tokenizer_source finds the same bundled directory
+                # for both when the checkpoint uses one shared tokenizer, and
+                # re-running AutoTokenizer.from_pretrained on it a second time
+                # cost ~0.7s of wall time on RunPod (confirmed per-call via
+                # tts_common/engine.py's tokenizer_load_calls instrumentation
+                # - both calls hit the identical repo_id). Reuse the parsed HF
+                # tokenizer instead of reloading it. Safe to share: __init__
+                # only sets padding_side/pad_token, both idempotent regardless
+                # of which wrapper does it, and add_bos is wrapper-level state
+                # that is never written back onto the shared tokenizer object.
+                caption_tokenizer = PretrainedTextTokenizer(
+                    tokenizer=tokenizer.tokenizer,
+                    add_bos=bool(model_cfg.caption_add_bos_resolved),
+                )
+            else:
+                caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
+                    repo_id=caption_tokenizer_source,
+                    add_bos=model_cfg.caption_add_bos_resolved,
+                    local_files_only=caption_tokenizer_is_local,
+                    revision=(None if caption_tokenizer_is_local else model_cfg.text_encoder_revision),
+                )
             if (
                 not model_cfg.use_pretrained_text_encoder
                 and caption_tokenizer.vocab_size != model_cfg.caption_vocab_size_resolved

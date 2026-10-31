@@ -702,65 +702,74 @@ class PretrainedTextBackbone(nn.Module):
             if not isinstance(model_type, str) or not model_type:
                 raise ValueError("Embedded pretrained text encoder config has no model_type.")
             config = AutoConfig.for_model(model_type, **raw_config)
-        if str(getattr(config, "model_type", "")).lower() == "t5gemma2":
-            # Loading AutoModel would materialize the decoder and vision tower before
-            # discarding them. Load only the bidirectional text encoder weights.
-            try:
-                from transformers.models.t5gemma2.modeling_t5gemma2 import (
-                    T5Gemma2TextEncoder,
-                )
-            except ImportError as exc:
-                raise RuntimeError(
-                    "The installed transformers version does not expose T5Gemma2TextEncoder."
-                ) from exc
-            if load_pretrained_weights:
-                backbone = T5Gemma2TextEncoder.from_pretrained(
-                    repo_id,
-                    config=config.encoder.text_config,
-                    eoi_token_index=config.eoi_token_index,
-                    trust_remote_code=False,
-                    low_cpu_mem_usage=True,
-                    revision=revision,
-                    key_mapping={r"^model\.encoder\.(.*)": r"\1"},
-                )
-            else:
-                with no_init_weights():
-                    backbone = T5Gemma2TextEncoder(
-                        config.encoder.text_config,
+        # Force real CPU construction here regardless of an ambient meta
+        # device context: inference_runtime.from_key builds the enclosing
+        # TextToLatentRFDiT under `torch.device("meta")` to skip its wasted
+        # random init, but this class's RoPE buffers (e.g. ModernBERT's
+        # `*_inv_freq`) are computed with real arithmetic in `__init__` and
+        # registered non-persistent - under meta they'd come out as
+        # uninitialized garbage that load_state_dict never restores, since it
+        # only ever touches *persistent* buffers.
+        with torch.device("cpu"):
+            if str(getattr(config, "model_type", "")).lower() == "t5gemma2":
+                # Loading AutoModel would materialize the decoder and vision tower before
+                # discarding them. Load only the bidirectional text encoder weights.
+                try:
+                    from transformers.models.t5gemma2.modeling_t5gemma2 import (
+                        T5Gemma2TextEncoder,
+                    )
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "The installed transformers version does not expose T5Gemma2TextEncoder."
+                    ) from exc
+                if load_pretrained_weights:
+                    backbone = T5Gemma2TextEncoder.from_pretrained(
+                        repo_id,
+                        config=config.encoder.text_config,
                         eoi_token_index=config.eoi_token_index,
-                    )
-        else:
-            if load_pretrained_weights:
-                loaded_model = AutoModel.from_pretrained(
-                    repo_id,
-                    config=config,
-                    trust_remote_code=False,
-                    low_cpu_mem_usage=True,
-                    revision=revision,
-                )
-            else:
-                with no_init_weights():
-                    loaded_model = AutoModel.from_config(
-                        config,
                         trust_remote_code=False,
+                        low_cpu_mem_usage=True,
+                        revision=revision,
+                        key_mapping={r"^model\.encoder\.(.*)": r"\1"},
                     )
-            if bool(getattr(config, "is_encoder_decoder", False)):
-                get_encoder = getattr(loaded_model, "get_encoder", None)
-                if get_encoder is None:
-                    raise ValueError(
-                        f"Encoder-decoder model does not expose get_encoder(): {repo_id}"
-                    )
-                encoder = get_encoder()
-                backbone = getattr(encoder, "text_model", encoder)
+                else:
+                    with no_init_weights():
+                        backbone = T5Gemma2TextEncoder(
+                            config.encoder.text_config,
+                            eoi_token_index=config.eoi_token_index,
+                        )
             else:
-                backbone = loaded_model
+                if load_pretrained_weights:
+                    loaded_model = AutoModel.from_pretrained(
+                        repo_id,
+                        config=config,
+                        trust_remote_code=False,
+                        low_cpu_mem_usage=True,
+                        revision=revision,
+                    )
+                else:
+                    with no_init_weights():
+                        loaded_model = AutoModel.from_config(
+                            config,
+                            trust_remote_code=False,
+                        )
+                if bool(getattr(config, "is_encoder_decoder", False)):
+                    get_encoder = getattr(loaded_model, "get_encoder", None)
+                    if get_encoder is None:
+                        raise ValueError(
+                            f"Encoder-decoder model does not expose get_encoder(): {repo_id}"
+                        )
+                    encoder = get_encoder()
+                    backbone = getattr(encoder, "text_model", encoder)
+                else:
+                    backbone = loaded_model
 
-        hidden_size = _pretrained_hidden_size(backbone.config)
-        # Keep the backbone weights in fp32. Hugging Face checkpoints load in
-        # bf16 by default, which would make optimizer states/updates run in pure
-        # bf16 (no fp32 master weights) and round away sub-ulp updates; autocast
-        # still executes the forward pass in bf16.
-        backbone = backbone.float()
+            hidden_size = _pretrained_hidden_size(backbone.config)
+            # Keep the backbone weights in fp32. Hugging Face checkpoints load in
+            # bf16 by default, which would make optimizer states/updates run in pure
+            # bf16 (no fp32 master weights) and round away sub-ulp updates; autocast
+            # still executes the forward pass in bf16.
+            backbone = backbone.float()
         # Register only the selected backbone. In the encoder-decoder case this
         # drops the decoder immediately after loading.
         self.backbone = backbone

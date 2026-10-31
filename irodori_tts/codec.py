@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,7 +76,8 @@ class DACVAECodec:
                 # Let DACVAE.load surface a clearer error if this is not a valid path/repo.
                 pass
 
-        model = DACVAE.load(location).eval().to(device)
+        model = cls._load_dacvae_fast(DACVAE, location)
+        model = model.eval().to(device)
         if dtype is not None:
             model = model.to(dtype=dtype)
 
@@ -113,6 +115,54 @@ class DACVAECodec:
             deterministic_decode=bool(deterministic_decode),
             normalize_db=None if normalize_db is None else float(normalize_db),
         )
+
+    @staticmethod
+    def _load_dacvae_fast(dacvae_cls, location: str):
+        """Load a plain (non torch.package) DACVAE weights.pth without paying
+        for DAC.__init__'s CPU RNG init pass.
+
+        ``dacvae_cls.load()`` goes through ``audiotools.ml.BaseModel.load()``,
+        which (for a plain weights file, not a torch.package) does::
+
+            model = cls(**metadata["kwargs"])          # DAC.__init__ calls
+                                                         # self.apply(init_weights):
+                                                         # real trunc_normal_ CPU RNG
+                                                         # over every Conv1d, only to
+                                                         # be overwritten a moment
+                                                         # later by...
+            model.load_state_dict(model_dict["state_dict"])
+
+        Same wasted-init pattern the meta-device build in model.py already
+        skips for TextToLatentRFDiT. Safe to do the same here: dacvae's own
+        modules (checked ``dacvae/nn/*.py`` and ``dacvae/model/dacvae.py``)
+        register no non-persistent buffers, so unlike PretrainedTextBackbone's
+        RoPE buffers there's nothing that needs real arithmetic at construction
+        time - everything meta gets is restored by load_state_dict below.
+
+        Falls back to the original ``dacvae_cls.load()`` path for anything
+        that isn't this plain weights-file shape (e.g. a torch.package export),
+        so a differently-packaged checkpoint still loads correctly, just
+        without the speedup.
+        """
+        try:
+            model_dict = torch.load(location, map_location="cpu")
+        except Exception:
+            model_dict = None
+
+        if not (isinstance(model_dict, dict) and "metadata" in model_dict and "state_dict" in model_dict):
+            return dacvae_cls.load(location)
+
+        metadata = model_dict["metadata"]
+        sig = inspect.signature(dacvae_cls)
+        class_keys = set(sig.parameters.keys())
+        kwargs = {k: v for k, v in metadata["kwargs"].items() if k in class_keys}
+
+        with torch.device("meta"):
+            model = dacvae_cls(**kwargs)
+        model._apply(lambda t: torch.empty_like(t, device="cpu") if t.is_meta else t)
+        model.load_state_dict(model_dict["state_dict"], strict=False)
+        model.metadata = metadata
+        return model
 
     @staticmethod
     def _configure_deterministic_decode(model: torch.nn.Module, device: str | torch.device) -> None:
